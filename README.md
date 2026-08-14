@@ -35,7 +35,7 @@ DeepSeek Harness 桌面启动器。一个基于 Tauri 的跨平台桌面应用�
 ## 支持平台
 
 - **macOS**：通过登录 shell（zsh + nvm）启动服务，退出时终止整个进程组；打包为 .app / .dmg（支持签名与公证）。
-- **Windows**：通过 `cmd /C npx …` 启动服务（不弹控制台窗口），退出时用 `taskkill /T` 终止整个进程树；打包为 NSIS 安装包。
+- **Windows**：通过 `cmd /C npx …` 启动服务（不弹控制台窗口），发布版 exe 以 GUI 子系统构建，双击启动不会弹出/驻留 CMD 窗口；退出时用 `taskkill /T` 终止整个进程树；打包为 NSIS 安装包。
 
 ## 环境要求
 
