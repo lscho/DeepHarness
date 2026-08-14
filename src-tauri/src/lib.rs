@@ -1,5 +1,4 @@
 use std::{
-    os::unix::process::CommandExt,
     process::{Child, Command, Stdio},
     sync::Mutex,
     time::Duration,
@@ -54,7 +53,64 @@ fn dsh_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/")
 }
 
-pub fn dsh_command(port: u16) -> Command {
+#[cfg(unix)]
+mod platform {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command};
+
+    /// 把子进程放进独立进程组，便于整组终止。
+    pub fn configure_command(command: &mut Command) {
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    /// 向整个进程组发送 SIGTERM。
+    pub fn stop_process_group(child: &mut Child) {
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGTERM);
+        }
+        let _ = child.wait();
+    }
+}
+
+#[cfg(windows)]
+mod platform {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Child, Command};
+
+    /// 子进程拥有独立进程组（与 Unix 的 setpgid 对应）。
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    /// 不创建控制台窗口，避免启动时弹出终端。
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    pub fn configure_command(command: &mut Command) {
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+
+    /// 用 taskkill 递归终止子进程整棵树。
+    pub fn stop_process_group(child: &mut Child) {
+        let pid = child.id();
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
+        let _ = child.wait();
+    }
+}
+
+fn dsh_command(port: u16) -> Command {
+    let mut command = dsh_launch_command(port);
+    platform::configure_command(&mut command);
+    command
+}
+
+#[cfg(unix)]
+fn dsh_launch_command(port: u16) -> Command {
     let mut command = Command::new("/bin/zsh");
     command
         .args(["-lc", &format!("source \"$HOME/.nvm/nvm.sh\" 2>/dev/null || true; exec npx @deepseek-ai/dsh web --port {port} --trusted-host 127.0.0.1:{port}")])
@@ -62,19 +118,22 @@ pub fn dsh_command(port: u16) -> Command {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
     command
 }
 
-fn process_group_id(pid: u32) -> i32 {
-    -(pid as i32)
+#[cfg(windows)]
+fn dsh_launch_command(port: u16) -> Command {
+    let mut command = Command::new("cmd");
+    command
+        .args([
+            "/C",
+            &format!("npx @deepseek-ai/dsh web --port {port} --trusted-host 127.0.0.1:{port}"),
+        ])
+        .env("npm_config_yes", "true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
 }
 
 fn dsh_navigation_url(address: &str) -> url::Url {
@@ -115,24 +174,24 @@ fn emit_status(app: &AppHandle, state: &'static str, message: impl Into<String>)
         state,
         message: message.into(),
     };
-    *app
-        .state::<AppState>()
+    *app.state::<AppState>()
         .status
         .lock()
         .expect("status lock poisoned") = status.clone();
-    let _ = app.emit(
-        "dsh-status",
-        status,
-    );
+    let _ = app.emit("dsh-status", status);
 }
 
 fn start_dsh(app: AppHandle) -> Result<(), String> {
     emit_status(&app, "starting", "正在启动 DeepSeek Harness…");
-    let address = dsh_url(reserve_port()?);
-    let child = dsh_command(address.rsplit(':').next().unwrap().trim_end_matches('/').parse().unwrap())
+    let port = reserve_port()?;
+    let address = dsh_url(port);
+    let child = dsh_command(port)
         .spawn()
         .map_err(|error| format!("无法启动 npx：{error}"))?;
-    *app.state::<AppState>().child.lock().expect("child lock poisoned") = Some(child);
+    *app.state::<AppState>()
+        .child
+        .lock()
+        .expect("child lock poisoned") = Some(child);
 
     tauri::async_runtime::spawn(async move {
         match wait_for_dsh(&address, STARTUP_TIMEOUT).await {
@@ -156,10 +215,7 @@ fn stop_dsh(app: &AppHandle) {
         .expect("child lock poisoned")
         .take()
     {
-        unsafe {
-            libc::kill(process_group_id(child.id()), libc::SIGTERM);
-        }
-        let _ = child.wait();
+        platform::stop_process_group(&mut child);
     }
 }
 
@@ -190,6 +246,7 @@ mod tests {
     use super::*;
     use std::{ffi::OsStr, time::Duration};
 
+    #[cfg(unix)]
     #[test]
     fn dsh_command_uses_login_shell_to_find_npx() {
         let command = dsh_command(43127);
@@ -200,9 +257,18 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
-    fn process_group_id_targets_the_childs_entire_group() {
-        assert_eq!(process_group_id(42), -42);
+    fn dsh_command_runs_npx_through_cmd() {
+        let command = dsh_command(43127);
+        assert_eq!(command.get_program(), OsStr::new("cmd"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                OsStr::new("/C"),
+                OsStr::new("npx @deepseek-ai/dsh web --port 43127 --trusted-host 127.0.0.1:43127")
+            ]
+        );
     }
 
     #[test]
@@ -220,7 +286,10 @@ mod tests {
 
     #[test]
     fn navigation_url_is_the_local_dsh_server() {
-        assert_eq!(dsh_navigation_url("http://127.0.0.1:43127/").port(), Some(43127));
+        assert_eq!(
+            dsh_navigation_url("http://127.0.0.1:43127/").port(),
+            Some(43127)
+        );
     }
 
     #[tokio::test]

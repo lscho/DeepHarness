@@ -17,5 +17,7 @@ tauri = { version = "2", features = [] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt", "time"] }
-libc = "0.2"
 url = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

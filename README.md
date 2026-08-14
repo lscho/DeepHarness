@@ -1,6 +1,6 @@
 # DeepHarness
 
-DeepSeek Harness 桌面启动器。一个基于 Tauri 的 macOS 桌面应用，负责在本地拉起 DeepSeek Harness（DSH）服务并打开其 Web 界面，免去手动在终端执行 `npx @deepseek-ai/dsh web` 的麻烦。
+DeepSeek Harness 桌面启动器。一个基于 Tauri 的跨平台桌面应用（macOS / Windows），负责在本地拉起 DeepSeek Harness（DSH）服务并打开其 Web 界面，免去手动在终端执行 `npx @deepseek-ai/dsh web` 的麻烦。
 
 ## 功能
 
@@ -13,7 +13,7 @@ DeepSeek Harness 桌面启动器。一个基于 Tauri 的 macOS 桌面应用，�
 
 | 部分     | 技术                               |
 | -------- | ---------------------------------- |
-| 桌面壳   | Tauri 2（Rust）                    |
+| 桌面壳   | Tauri 2（Rust，跨平台：macOS / Windows） |
 | 前端     | Vite + TypeScript + 原生 WebView   |
 | 服务检测 | reqwest 轮询就绪检查（45s 超时）   |
 | 测试     | Vitest（前端）+ Rust 单元测试      |
@@ -32,11 +32,16 @@ DeepSeek Harness 桌面启动器。一个基于 Tauri 的 macOS 桌面应用，�
 └── scripts/              # 打包辅助脚本
 ```
 
+## 支持平台
+
+- **macOS**：通过登录 shell（zsh + nvm）启动服务，退出时终止整个进程组；打包为 .app / .dmg（支持签名与公证）。
+- **Windows**：通过 `cmd /C npx …` 启动服务（不弹控制台窗口），退出时用 `taskkill /T` 终止整个进程树；打包为 NSIS 安装包。
+
 ## 环境要求
 
-- macOS（使用 `/bin/zsh` 与 nvm，打包目标为 app/dmg）
 - Node.js + npm
 - Rust 工具链（构建 Tauri 需要）
+- macOS 打包签名/公证需要 Apple Developer 证书与 App Store Connect API Key
 
 ## 开发
 
