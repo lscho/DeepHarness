@@ -1,0 +1,21 @@
+[package]
+name = "deepharness"
+version = "0.0.1"
+description = "DeepSeek Harness desktop launcher"
+authors = ["DeepHarness"]
+edition = "2021"
+
+[lib]
+name = "deepharness_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+libc = "0.2"
+url = "2"

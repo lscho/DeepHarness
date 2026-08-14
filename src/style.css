@@ -1,0 +1,49 @@
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #0f172a;
+  background: #ffffff;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+.startup-card {
+  box-sizing: border-box;
+  display: grid;
+  min-height: 100vh;
+  place-content: center;
+  text-align: center;
+}
+
+.error-card {
+  max-width: 38rem;
+  padding: 2rem;
+}
+
+.eyebrow {
+  color: #0891b2;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+}
+
+h1 {
+  font-size: 1.5rem;
+  font-weight: 600;
+}
+
+.message {
+  color: #475569;
+}
+
+.hint {
+  color: #64748b;
+  font-size: 0.875rem;
+}
+
+code {
+  color: #0891b2;
+}
