@@ -8,11 +8,9 @@ export { renderStatus } from "./status";
 const app = document.querySelector<HTMLDivElement>("#app");
 
 function applyStatus(status: DshStatus) {
-  if (status.state === "ready") {
-    window.location.replace("http://127.0.0.1:3080/");
-    return;
-  }
-
+  // Navigation to the DSH Web GUI is owned by the Rust side: only it knows the
+  // per-process authenticated URL (`http://127.0.0.1:<port>/?token=…`) that DSH
+  // prints at startup, and the bare origin answers 401 without it.
   if (app) {
     app.innerHTML = renderStatus(status);
   }

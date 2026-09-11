@@ -1,12 +1,20 @@
 use std::{
-    process::{Child, Command, Stdio},
+    io::{BufRead, BufReader},
+    process::{Child, ChildStdout, Command, Stdio},
     sync::Mutex,
     time::Duration,
 };
 
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
+use tokio::sync::oneshot;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
+/// How often the fallback probe re-checks a DSH revision that prints no token URL.
+const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// The loopback literal `dsh web` binds and prints for this launcher.
+const LOOPBACK_HOST: &str = "127.0.0.1";
+/// Query parameter carrying the per-process launch token in the printed URL.
+const TOKEN_QUERY: &str = "token";
 
 pub struct AppState {
     child: Mutex<Option<Child>>,
@@ -42,7 +50,7 @@ fn dsh_status(state: tauri::State<AppState>) -> DshStatus {
 }
 
 fn reserve_port() -> Result<u16, String> {
-    std::net::TcpListener::bind("127.0.0.1:0")
+    std::net::TcpListener::bind((LOOPBACK_HOST, 0))
         .map_err(|error| format!("无法选择空闲端口：{error}"))?
         .local_addr()
         .map(|address| address.port())
@@ -50,7 +58,7 @@ fn reserve_port() -> Result<u16, String> {
 }
 
 fn dsh_url(port: u16) -> String {
-    format!("http://127.0.0.1:{port}/")
+    format!("http://{LOOPBACK_HOST}:{port}/")
 }
 
 #[cfg(unix)]
@@ -113,10 +121,11 @@ fn dsh_command(port: u16) -> Command {
 fn dsh_launch_command(port: u16) -> Command {
     let mut command = Command::new("/bin/zsh");
     command
-        .args(["-lc", &format!("source \"$HOME/.nvm/nvm.sh\" 2>/dev/null || true; exec npx @deepseek-ai/dsh web --port {port} --trusted-host 127.0.0.1:{port}")])
+        .args(["-lc", &format!("source \"$HOME/.nvm/nvm.sh\" 2>/dev/null || true; exec npx @deepseek-ai/dsh web --port {port} --trusted-host {LOOPBACK_HOST}:{port}")])
         .env("npm_config_yes", "true")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        // Piped so the launcher can read the authenticated URL `dsh web` prints.
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
     command
 }
@@ -127,11 +136,14 @@ fn dsh_launch_command(port: u16) -> Command {
     command
         .args([
             "/C",
-            &format!("npx @deepseek-ai/dsh web --port {port} --trusted-host 127.0.0.1:{port}"),
+            &format!(
+                "npx @deepseek-ai/dsh web --port {port} --trusted-host {LOOPBACK_HOST}:{port}"
+            ),
         ])
         .env("npm_config_yes", "true")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        // Piped so the launcher can read the authenticated URL `dsh web` prints.
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
     command
 }
@@ -151,22 +163,105 @@ fn is_exit_event(event: &RunEvent) -> bool {
     matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit)
 }
 
-pub async fn wait_for_dsh(url: &str, timeout: Duration) -> Result<(), String> {
-    let client = reqwest::Client::new();
-    let polling = async {
-        loop {
-            if let Ok(response) = client.get(url).send().await {
-                if response.status().is_success() {
-                    return Ok(());
+/// Read the authenticated URL out of one line of `dsh web` output.
+///
+/// DSH mints a launch token per process and announces it as the only way into
+/// the Web GUI:
+///
+/// ```text
+/// dsh web: http://127.0.0.1:43127/?token=<secret> (LAN: http://192.168.1.4:43127/?token=<secret>)
+/// ```
+///
+/// A bare `GET /` without that token (or the cookie it mints) now answers 401,
+/// so the launcher must open exactly this URL. Only the loopback origin we
+/// spawned is accepted: the LAN candidate on the same line is ignored, and a
+/// URL for another port is refused so stray output can never redirect the
+/// desktop window somewhere else.
+fn parse_launch_url(line: &str, port: u16) -> Option<String> {
+    line.split_whitespace().find_map(|word| {
+        // The announcement is prose, so the trailing `)` of the LAN note sticks
+        // to the URL we want.
+        let candidate = word.trim_end_matches([')', ',', '.']);
+        let url = url::Url::parse(candidate).ok()?;
+        if url.scheme() != "http" || url.host_str() != Some(LOOPBACK_HOST) {
+            return None;
+        }
+        if url.port() != Some(port) {
+            return None;
+        }
+        let (_, token) = url.query_pairs().find(|(key, _)| key == TOKEN_QUERY)?;
+        if token.is_empty() {
+            return None;
+        }
+        Some(url.to_string())
+    })
+}
+
+/// Drain `dsh web`'s stdout and hand over the authenticated URL it announces.
+///
+/// The reader must keep consuming the pipe for the whole process lifetime: an
+/// unread pipe eventually blocks the child once the buffer fills.
+fn spawn_launch_url_reader(stdout: ChildStdout, port: u16) -> oneshot::Receiver<String> {
+    let (sender, receiver) = oneshot::channel();
+    std::thread::spawn(move || {
+        let mut sender = Some(sender);
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if let Some(url) = parse_launch_url(&line, port) {
+                if let Some(sender) = sender.take() {
+                    let _ = sender.send(url);
                 }
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
         }
-    };
+    });
+    receiver
+}
 
-    tokio::time::timeout(timeout, polling)
-        .await
-        .map_err(|_| format!("timed out waiting for DeepSeek Harness at {url}"))?
+/// Whether the bare origin already serves the Web GUI.
+///
+/// This is the readiness signal of DSH revisions without browser
+/// authentication; token-guarded revisions answer 401 here and are reported
+/// through the announcement channel instead.
+async fn serves_web_gui(client: &reqwest::Client, url: &str) -> bool {
+    match client.get(url).send().await {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// Resolve the URL the window must open: the announced token URL when
+/// `dsh web` prints one, else the bare origin once it answers.
+pub async fn wait_for_endpoint(
+    base_url: &str,
+    announced: Option<oneshot::Receiver<String>>,
+    timeout: Duration,
+) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let mut announced = announced;
+    let mut announcement_pending = announced.is_some();
+    let mut poll = tokio::time::interval(READINESS_POLL_INTERVAL);
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        tokio::select! {
+            result = async { announced.as_mut().expect("announcement pending").await }, if announcement_pending => {
+                announcement_pending = false;
+                if let Ok(url) = result {
+                    return Ok(url);
+                }
+            }
+            _ = poll.tick() => {
+                if serves_web_gui(&client, base_url).await {
+                    return Ok(base_url.to_owned());
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(format!(
+                    "等待 DeepSeek Harness 就绪超时（{base_url}）。请确认终端中 `npx @deepseek-ai/dsh web` 能正常启动并打印访问地址。"
+                ));
+            }
+        }
+    }
 }
 
 fn emit_status(app: &AppHandle, state: &'static str, message: impl Into<String>) {
@@ -184,18 +279,24 @@ fn emit_status(app: &AppHandle, state: &'static str, message: impl Into<String>)
 fn start_dsh(app: AppHandle) -> Result<(), String> {
     emit_status(&app, "starting", "正在启动 DeepSeek Harness…");
     let port = reserve_port()?;
-    let address = dsh_url(port);
-    let child = dsh_command(port)
+    let base_url = dsh_url(port);
+    let mut child = dsh_command(port)
         .spawn()
         .map_err(|error| format!("无法启动 npx：{error}"))?;
+    let announced = child
+        .stdout
+        .take()
+        .map(|stdout| spawn_launch_url_reader(stdout, port));
     *app.state::<AppState>()
         .child
         .lock()
         .expect("child lock poisoned") = Some(child);
 
     tauri::async_runtime::spawn(async move {
-        match wait_for_dsh(&address, STARTUP_TIMEOUT).await {
-            Ok(()) => {
+        let endpoint = wait_for_endpoint(&base_url, announced, STARTUP_TIMEOUT).await;
+
+        match endpoint {
+            Ok(address) => {
                 emit_status(&app, "ready", "DeepSeek Harness 已就绪");
                 if let Err(error) = navigate_to_dsh(&app, &address) {
                     emit_status(&app, "error", error);
@@ -292,11 +393,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn navigation_url_keeps_the_launch_token() {
+        let url = dsh_navigation_url(
+            "http://127.0.0.1:43127/?token=_ibOyVQb5jrgSQlct4_tk-jwZmHF9dCJyRnZUSFJmLU",
+        );
+
+        assert_eq!(url.path(), "/");
+        assert_eq!(
+            url.query(),
+            Some("token=_ibOyVQb5jrgSQlct4_tk-jwZmHF9dCJyRnZUSFJmLU")
+        );
+    }
+
     #[tokio::test]
     async fn readiness_check_times_out_for_unreachable_server() {
-        let error = wait_for_dsh("http://127.0.0.1:9/", Duration::from_millis(30))
+        let (_sender, announced) = oneshot::channel();
+        let error = wait_for_endpoint(
+            "http://127.0.0.1:9/",
+            Some(announced),
+            Duration::from_millis(30),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("超时"));
+    }
+
+    #[tokio::test]
+    async fn readiness_check_falls_back_when_no_url_is_announced() {
+        let error = wait_for_endpoint("http://127.0.0.1:9/", None, Duration::from_millis(30))
             .await
             .unwrap_err();
-        assert!(error.contains("timed out"));
+        assert!(error.contains("超时"));
+    }
+
+    #[tokio::test]
+    async fn announced_token_url_wins_over_the_bare_origin() {
+        let (sender, announced) = oneshot::channel();
+        sender
+            .send("http://127.0.0.1:43127/?token=abc123".to_owned())
+            .expect("receiver is alive");
+        assert_eq!(
+            wait_for_endpoint(
+                "http://127.0.0.1:43127/",
+                Some(announced),
+                Duration::from_secs(1)
+            )
+            .await
+            .unwrap(),
+            "http://127.0.0.1:43127/?token=abc123"
+        );
+    }
+
+    #[test]
+    fn launch_url_is_read_from_the_announcement_line() {
+        let line = "dsh web: http://127.0.0.1:43127/?token=_ibOyVQb5jrgSQlct4_tk-jwZmHF9dCJyRnZUSFJmLU (LAN: http://192.168.1.4:43127/?token=_ibOyVQb5jrgSQlct4_tk-jwZmHF9dCJyRnZUSFJmLU)";
+        assert_eq!(
+            parse_launch_url(line, 43127).as_deref(),
+            Some("http://127.0.0.1:43127/?token=_ibOyVQb5jrgSQlct4_tk-jwZmHF9dCJyRnZUSFJmLU")
+        );
+    }
+
+    #[test]
+    fn launch_url_ignores_unrelated_output() {
+        assert_eq!(
+            parse_launch_url(
+                "dsh web: opening the default browser; pass --no-open to disable",
+                43127
+            ),
+            None
+        );
+        assert_eq!(parse_launch_url("", 43127), None);
+        // A bare origin is not an authenticated URL.
+        assert_eq!(
+            parse_launch_url("dsh web: http://127.0.0.1:43127/", 43127),
+            None
+        );
+        // The LAN candidate and any other authority must not move the window.
+        assert_eq!(
+            parse_launch_url("http://192.168.1.4:43127/?token=abc", 43127),
+            None
+        );
+        // A token URL for another port is refused.
+        assert_eq!(
+            parse_launch_url("http://127.0.0.1:3080/?token=abc", 43127),
+            None
+        );
+        // An empty token is not a credential.
+        assert_eq!(
+            parse_launch_url("http://127.0.0.1:43127/?token=", 43127),
+            None
+        );
     }
 }
