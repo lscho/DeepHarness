@@ -16,9 +16,10 @@ DeepSeek Harness 桌面启动器。一个基于 Tauri 的跨平台桌面应用�
 
 ## 说明
 
-- DSH 服务通过 `npx @deepseek-ai/dsh web --port <port> --trusted-host 127.0.0.1:<port>` 启动，需要网络能访问 npm 仓库以获取包。
+- DSH 服务通过 `npx @deepseek-ai/dsh web --port <port> --trusted-host 127.0.0.1:<port> --no-open` 启动，需要网络能访问 npm 仓库以获取包。
 - 启动器通过管道读取 `dsh web` 的 stdout，从 `dsh web: http://127.0.0.1:<port>/?token=…` 这一行解析出本次进程的访问地址；令牌是进程级随机的、不落盘，所以每次启动都必须重新解析。
-- `dsh web` 还会把该地址交给系统默认浏览器（DSH 侧 `openBrowser` 默认为 true）。若只想在应用窗口内打开，可在 `src-tauri/src/lib.rs` 的 `dsh_launch_command` 中追加 `--no-open`。
+- 打开窗口时依次访问 `about:blank` → 带令牌地址 → 裸地址。原因：DSH 的会话 Cookie 带 `SameSite=Strict`，而 WebKit 会把“发起这次导航的当前文档”（打包后是 `tauri://localhost`，开发时是 `http://localhost:1420`）当成跨站来源，于是 303 跳转回 `/` 时不带 Cookie，窗口会渲染出 `dsh web authentication required; reopen the URL printed by dsh web.`。先清空文档即可去掉该来源；最后再访问一次裸地址（同站请求），既是无害刷新，也是 Cookie 仍被扣留时的兜底恢复。
+- `dsh web` 默认会把该地址交给系统默认浏览器（DSH 侧 `openBrowser` 默认为 true），导致除了应用窗口外再弹出一个浏览器标签页。启动命令已追加 `--no-open`，现在只会在应用窗口内打开。
 - 服务启动超时时间为 45 秒，超时后界面会显示错误信息。
 
 ## 已知限制

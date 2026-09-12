@@ -121,7 +121,7 @@ fn dsh_command(port: u16) -> Command {
 fn dsh_launch_command(port: u16) -> Command {
     let mut command = Command::new("/bin/zsh");
     command
-        .args(["-lc", &format!("source \"$HOME/.nvm/nvm.sh\" 2>/dev/null || true; exec npx @deepseek-ai/dsh web --port {port} --trusted-host {LOOPBACK_HOST}:{port}")])
+        .args(["-lc", &format!("source \"$HOME/.nvm/nvm.sh\" 2>/dev/null || true; exec npx @deepseek-ai/dsh web --port {port} --trusted-host {LOOPBACK_HOST}:{port} --no-open")])
         .env("npm_config_yes", "true")
         .stdin(Stdio::null())
         // Piped so the launcher can read the authenticated URL `dsh web` prints.
@@ -136,9 +136,9 @@ fn dsh_launch_command(port: u16) -> Command {
     command
         .args([
             "/C",
-            &format!(
-                "npx @deepseek-ai/dsh web --port {port} --trusted-host {LOOPBACK_HOST}:{port}"
-            ),
+                &format!(
+                    "npx @deepseek-ai/dsh web --port {port} --trusted-host {LOOPBACK_HOST}:{port} --no-open"
+                ),
         ])
         .env("npm_config_yes", "true")
         .stdin(Stdio::null())
@@ -148,15 +148,61 @@ fn dsh_launch_command(port: u16) -> Command {
     command
 }
 
-fn dsh_navigation_url(address: &str) -> url::Url {
-    url::Url::parse(address).expect("DSH URL must be valid")
+fn dsh_navigation_url(address: &str) -> Result<url::Url, String> {
+    url::Url::parse(address)
+        .map_err(|error| format!("无法打开 DeepSeek Harness：地址 {address} 无效（{error}）"))
 }
 
-fn navigate_to_dsh(app: &AppHandle, address: &str) -> Result<(), String> {
-    app.get_webview_window("main")
-        .ok_or_else(|| "找不到主窗口".to_owned())?
-        .navigate(dsh_navigation_url(address))
-        .map_err(|error| format!("无法打开 DeepSeek Harness：{error}"))
+/// URLs the window is walked through to obtain a browser session, in order.
+///
+/// DSH hands out its session cookie with `SameSite=Strict` on the 303 that
+/// follows `GET /?token=…`. WebKit attaches the *current document* as the
+/// initiator of an app-initiated navigation, so navigating straight from the
+/// launcher page (`tauri://localhost` in a bundle, `http://localhost:1420` in
+/// development) into that URL makes the redirect cross-site: the freshly minted
+/// Strict cookie is **not** sent on the follow-up request for `/`, and the
+/// window renders DSH's raw `dsh web authentication required` page. Clearing the
+/// document first removes the initiator, so the exchange succeeds on the first
+/// try; the trailing load of the bare origin is same-site and therefore both a
+/// harmless refresh and the recovery path when a WebKit build still withholds
+/// the cookie.
+fn navigation_sequence(endpoint: &str, base_url: &str) -> [String; 3] {
+    [
+        "about:blank".to_owned(),
+        endpoint.to_owned(),
+        base_url.to_owned(),
+    ]
+}
+
+/// Delay before opening the authenticated URL, so `about:blank` has committed.
+const INITIATOR_CLEAR_DELAY: Duration = Duration::from_millis(200);
+/// Delay before the confirming same-site load of the bare origin.
+const SESSION_CONFIRM_DELAY: Duration = Duration::from_millis(1200);
+
+async fn open_dsh_window(app: &AppHandle, endpoint: &str, base_url: &str) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "找不到主窗口".to_owned())?;
+
+    let [blank, authenticated, bare] = navigation_sequence(endpoint, base_url);
+
+    // Best effort: a build that refuses `about:blank` still recovers through the
+    // same-site load below.
+    if let Ok(url) = dsh_navigation_url(&blank) {
+        let _ = window.navigate(url);
+        tokio::time::sleep(INITIATOR_CLEAR_DELAY).await;
+    }
+
+    window
+        .navigate(dsh_navigation_url(&authenticated)?)
+        .map_err(|error| format!("无法打开 DeepSeek Harness：{error}"))?;
+
+    tokio::time::sleep(SESSION_CONFIRM_DELAY).await;
+    window
+        .navigate(dsh_navigation_url(&bare)?)
+        .map_err(|error| format!("无法打开 DeepSeek Harness：{error}"))?;
+
+    Ok(())
 }
 
 fn is_exit_event(event: &RunEvent) -> bool {
@@ -298,7 +344,7 @@ fn start_dsh(app: AppHandle) -> Result<(), String> {
         match endpoint {
             Ok(address) => {
                 emit_status(&app, "ready", "DeepSeek Harness 已就绪");
-                if let Err(error) = navigate_to_dsh(&app, &address) {
+                if let Err(error) = open_dsh_window(&app, &address, &base_url).await {
                     emit_status(&app, "error", error);
                 }
             }
@@ -354,7 +400,7 @@ mod tests {
         assert_eq!(command.get_program(), OsStr::new("/bin/zsh"));
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            [OsStr::new("-lc"), OsStr::new("source \"$HOME/.nvm/nvm.sh\" 2>/dev/null || true; exec npx @deepseek-ai/dsh web --port 43127 --trusted-host 127.0.0.1:43127")]
+            [OsStr::new("-lc"), OsStr::new("source \"$HOME/.nvm/nvm.sh\" 2>/dev/null || true; exec npx @deepseek-ai/dsh web --port 43127 --trusted-host 127.0.0.1:43127 --no-open")]
         );
     }
 
@@ -367,7 +413,7 @@ mod tests {
             command.get_args().collect::<Vec<_>>(),
             [
                 OsStr::new("/C"),
-                OsStr::new("npx @deepseek-ai/dsh web --port 43127 --trusted-host 127.0.0.1:43127")
+                OsStr::new("npx @deepseek-ai/dsh web --port 43127 --trusted-host 127.0.0.1:43127 --no-open")
             ]
         );
     }
@@ -388,7 +434,9 @@ mod tests {
     #[test]
     fn navigation_url_is_the_local_dsh_server() {
         assert_eq!(
-            dsh_navigation_url("http://127.0.0.1:43127/").port(),
+            dsh_navigation_url("http://127.0.0.1:43127/")
+                .expect("valid")
+                .port(),
             Some(43127)
         );
     }
@@ -397,13 +445,35 @@ mod tests {
     fn navigation_url_keeps_the_launch_token() {
         let url = dsh_navigation_url(
             "http://127.0.0.1:43127/?token=_ibOyVQb5jrgSQlct4_tk-jwZmHF9dCJyRnZUSFJmLU",
-        );
+        )
+        .expect("valid");
 
         assert_eq!(url.path(), "/");
         assert_eq!(
             url.query(),
             Some("token=_ibOyVQb5jrgSQlct4_tk-jwZmHF9dCJyRnZUSFJmLU")
         );
+    }
+
+    #[test]
+    fn navigation_clears_the_initiator_before_using_the_token() {
+        let token_url = "http://127.0.0.1:43127/?token=abc123";
+        let sequence = navigation_sequence(token_url, "http://127.0.0.1:43127/");
+
+        assert_eq!(sequence[0], "about:blank");
+        assert_eq!(sequence[1], token_url);
+        // The last hop must be the bare origin: a same-site load that both
+        // refreshes a live session and recovers one whose cookie WebKit
+        // withheld on the cross-site redirect.
+        assert_eq!(sequence[2], "http://127.0.0.1:43127/");
+        for step in sequence {
+            assert!(dsh_navigation_url(&step).is_ok(), "{step} must parse");
+        }
+    }
+
+    #[test]
+    fn navigation_url_rejects_garbage() {
+        assert!(dsh_navigation_url("not a url").is_err());
     }
 
     #[tokio::test]
